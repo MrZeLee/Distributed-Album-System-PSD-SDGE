@@ -161,6 +161,20 @@ album(UsersAlbum, PrimaryRoom, Files) ->
                 {ok, _} ->
                     Pid ! {line, <<"User already in album\n">>},
                     album(UsersAlbum, PrimaryRoom, Files)
+            end;
+        {removeUser, Pid, Username} ->
+            case maps:find(Username, UsersAlbum) of
+                error ->
+                    Pid ! {line, <<"User not found\n">>},
+                    album(UsersAlbum, PrimaryRoom, Files);
+                {ok, {}} ->
+                    Pid ! {line, <<"User removed from album\n">>},
+                    album(maps:remove(Username, UsersAlbum), PrimaryRoom, Files);
+                {ok, _Pid} ->
+                    Pid ! {line, <<"User removed from album\n">>},
+                    % remove key from map
+                    _Pid ! {removedFromAlbum, self()},
+                    album(maps:remove(Username, UsersAlbum), PrimaryRoom, Files)
             end
     end.
 
@@ -199,6 +213,11 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
             inet:setopts(Sock, [{active, once}]),
             PrimaryRoomPid ! {leave, User},
             user(Sock, Username, LoginPid, PrimaryRoomPid, NewAlbumPid);
+        {removedFromAlbum, _} ->
+            gen_tcp:send(Sock, <<"removed from album\n">>),
+            inet:setopts(Sock, [{active, once}]),
+            PrimaryRoomPid ! {enter, User},
+            user(Sock, Username, LoginPid, PrimaryRoomPid, {});
         {line, {{_Username, Self}, Data}} ->
             io:format("~p sended ~p~n", [Self,Data]),
             inet:setopts(Sock, [{active, once}]),
@@ -287,7 +306,7 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
                         _ ->
                             case Data of
                                 <<"/help\n", _/binary>> ->
-                                    gen_tcp:send(Sock, <<"Commands: /quit, /send, /addUser, /logout\n">>),
+                                    gen_tcp:send(Sock, <<"Commands: /quit, /send, /addUser, /removeUser, /logout\n">>),
                                     inet:setopts(Sock, [{active, once}]),
                                     user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid);
                                 <<"/quit\n", _/binary>> ->
@@ -306,6 +325,12 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
                                     io:format("~p adding user ~p~n", [Username, _Username]),
                                     __User = trim_newline(_Username),
                                     AlbumPid ! {addUser, Self, __User},
+                                    inet:setopts(Sock, [{active, once}]),
+                                    user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid);
+                                <<"/removeUser ", _Username/binary>> ->
+                                    io:format("~p removing user ~p~n", [Username, _Username]),
+                                    __Username = trim_newline(_Username),
+                                    AlbumPid ! {removeUser, Self, __Username},
                                     inet:setopts(Sock, [{active, once}]),
                                     user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid);
                                 _ ->
