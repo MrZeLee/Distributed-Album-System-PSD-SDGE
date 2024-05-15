@@ -16,6 +16,7 @@ server(Port) ->
 
 acceptor(LSock, Room, Login) ->
     {ok, Sock} = gen_tcp:accept(LSock),
+    io:format("Accepted connection ~p~n", [Sock]),
     spawn(fun() -> acceptor(LSock, Room, Login) end),
     user(Sock, {}, Login, Room, {}).
 
@@ -128,7 +129,7 @@ album(Metadata) ->
                     album(Metadata#{<<"users">> => UsersAlbum#{Username => #{<<"pid">> => Pid, <<"router">> => Router}}})
             end;
         {line, Data} ->
-            [Pid ! {line, Data} || {Pid,_} <- lists:filter(fun(X) -> X =/= {} end, maps:values(UsersAlbum))],
+            [Pid ! {line, Data} || {Pid,_} <- lists:filter(fun(X) -> X =/= null end, maps:values(UsersAlbum))],
             album(Metadata);
         {leave, {Username,Pid}} ->
             case maps:find(Username, UsersAlbum) of
@@ -385,6 +386,7 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
                     LoginPid ! {logout, User}
             end;
         {tcp_closed, _} ->
+            io:format("Connection closed ~p~n", [Sock]),
             case Username of
                 {} ->
                     ok;
@@ -398,6 +400,7 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
                     LoginPid ! {logout, User}
             end;
         {tcp_error, _, _} ->
+            io:format("Connection error ~p~n", [Sock]),
             case Username of
                 {} ->
                     ok;
