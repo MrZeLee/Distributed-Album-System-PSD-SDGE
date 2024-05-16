@@ -1,3 +1,4 @@
+import time
 import threading
 import queue
 import socket
@@ -13,6 +14,8 @@ zmq_connect_queue = queue.Queue()
 
 # Shared flag indicating whether to use ZeroMQ for sending messages
 use_zmq_for_sending = threading.Event()
+
+localdata = {}
 
 def output_thread():
     """ Thread that prints messages from other threads. """
@@ -89,6 +92,13 @@ def zmq_pub_thread(context_pub, pub):
         message = zmq_send_queue.get()
         if message == "exit":
             use_zmq_for_sending.clear()
+        elif "/getMetadata" == message:
+            message_queue.put(json.dumps(localdata)+"\n")
+        elif message == "/getMetadataFomAll":
+            time.sleep(2)
+            pub.send_string("/getMetadataFromAll")
+        elif message == "/getMetadataFromAllRequest":
+            pub.send_string(json.dumps(localdata)+"\n")
         else:
             message = message + "\n"
             #send to all subscribers
@@ -104,6 +114,12 @@ def zmq_sub_thread(context_sub, sub):
                 if message[-1] == "\n":
                     message = message[:-1]
                 sub.disconnect(message)
+            elif message == "/getMetadataFromAll":
+                zmq_send_queue.put("/getMetadataFromAllRequest")
+            elif message[0] == "{":
+                if message[-1] == "\n":
+                    message = message[:-1]
+                localdata.update(json.loads(message))
             else:
                 message_queue.put(message)
             # message_queue.put(message.decode())
@@ -126,9 +142,16 @@ def zmq_connect(zmq_url,sub):
         else:
             try:
                 message_json = json.loads(message)
-                for router in extract_routers(message_json):
+                count = 0
+                routers = extract_routers(message_json)
+                for router in routers:
                     if zmq_url != router:
+                        count += 1
                         sub.connect(router)
+                if count == 0:
+                    localdata.update(message_json)
+                else:
+                    zmq_send_queue.put("/getMetadataFomAll")
             except Exception as e:
                 print(message)
 
