@@ -116,7 +116,6 @@ room(Users, Albums) ->
 
 album(Metadata) ->
     UsersAlbum = maps:get(<<"users">>,Metadata),
-    % Files = maps:get(<<"images">>,Metadata),
     receive
         {enter, {Username,Pid}, Router} ->
             case maps:find(Username, UsersAlbum) of
@@ -125,7 +124,7 @@ album(Metadata) ->
                     album(Metadata);
                 {ok, _} ->
                     Pid ! {enterAlbum, self()},
-                    [maps:get(<<"pid">>,Map) ! {line, << Router/binary, "\n">>} || Map <- lists:filter(fun(X) -> X =/= null end, maps:values(UsersAlbum))],
+                    [maps:get(<<"pid">>,Map) ! {line, <<"/connectTo ", Router/binary, "\n">>} || Map <- lists:filter(fun(X) -> X =/= null end, maps:values(UsersAlbum))],
                     album(Metadata#{<<"users">> => UsersAlbum#{Username => #{<<"pid">> => Pid, <<"router">> => Router}}})
             end;
         {line, Data} ->
@@ -145,36 +144,13 @@ album(Metadata) ->
                 error ->
                     album(Metadata)
             end;
-        {addUser, Pid, Username} ->
-            case maps:find(Username, UsersAlbum) of
-                error ->
-                    Pid ! {line, <<"User added to Album\n">>},
-                    album(Metadata#{<<"users">> => UsersAlbum#{Username => null}});
-                {ok, _} ->
-                    Pid ! {line, <<"User already in album\n">>},
-                    album(Metadata)
-            end;
-        {removeUser, Pid, Username} ->
-            case maps:find(Username, UsersAlbum) of
-                error ->
-                    Pid ! {line, <<"User not found\n">>},
-                    album(Metadata);
-                {ok, {}} ->
-                    Pid ! {line, <<"User removed from album\n">>},
-                    album(Metadata#{<<"users">> => maps:remove(Username, UsersAlbum)});
-                {ok, _Pid} ->
-                    Pid ! {line, <<"User removed from album\n">>},
-                    % remove key from map
-                    _Pid ! {removedFromAlbum, self()},
-                    album(Metadata#{<<"users">> => maps:remove(Username, UsersAlbum)})
-            end;
         {getMetadata, Pid} ->
             % #{Username => Pid},#{Filename => {Hash, #{Username => Rating(0-5)}}}
             % UsersAlbum keys to json like Usernames : [Username1, Username2]
             % use jsone:encode to convert {UsersAlbum, Files} to json
             % Json = json:encode([UsersAlbum, Files]),
             Json = jsone:encode(Metadata),
-            Pid ! {line, << Json/binary , "\n">>},
+            Pid ! {line, <<"Metadata:", Json/binary , "\n">>},
             album(Metadata);
         {setMetadata, Pid, _Metadata} ->
             __Metadata = jsone:decode(_Metadata),
@@ -223,7 +199,7 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
             inet:setopts(Sock, [{active, once}]),
             user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid);
         {login, ok, _Username} ->
-            gen_tcp:send(Sock, <<"logged in ", _Username/binary, "\n">>),
+            gen_tcp:send(Sock, <<"/loginOk ", _Username/binary, "\n">>),
             inet:setopts(Sock, [{active, once}]),
             PrimaryRoomPid ! {enter, {_Username, Self}},
             user(Sock, _Username, LoginPid, PrimaryRoomPid, AlbumPid);
@@ -232,7 +208,7 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
             inet:setopts(Sock, [{active, once}]),
             user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid);
         {enterAlbum, NewAlbumPid} ->
-            gen_tcp:send(Sock, <<"entered album\n">>),
+            gen_tcp:send(Sock, <<"/enterAlbum\n">>),
             inet:setopts(Sock, [{active, once}]),
             PrimaryRoomPid ! {leave, User},
             user(Sock, Username, LoginPid, PrimaryRoomPid, NewAlbumPid);

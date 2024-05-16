@@ -6,6 +6,8 @@ import zmq
 import sys
 import json
 
+debug = True
+
 # Global queues for inter-thread communication
 message_queue = queue.Queue()
 tcp_send_queue = queue.Queue()
@@ -15,6 +17,8 @@ zmq_connect_queue = queue.Queue()
 # Shared flag indicating whether to use ZeroMQ for sending messages
 use_zmq_for_sending = threading.Event()
 terminate = threading.Event()
+
+connected_pubs = set()
 
 def get_images_info(data):
     # get json data from localdata where data['images'] has a map of where the key is the image name and the value is another map where it has a key named
@@ -44,47 +48,58 @@ def output_thread():
     """ Thread that prints messages from other threads. """
     while True and not terminate.is_set():
         message = message_queue.get()
-        if message == "exit":
-            break
+        if message == "":
+            continue
         print(message, end="")
     print("Exiting output_thread.")
 
 def input_thread():
     """ Thread that captures terminal input and forwards it to queues. """
-    while True and not terminate.is_set():
+    while True:
         try:
             user_input = input()
+            if terminate.is_set():
+                break
             if use_zmq_for_sending.is_set():
-                if user_input == "/getImages":
+                if user_input == "/quit":
+                    tcp_send_queue.put("/quit")
+                    zmq_send_queue.put("/quit")
+                    zmq_connect_queue.put("/quit")
+                    use_zmq_for_sending.clear()
+                elif user_input == "/getImages":
                     images_info = get_images_info(localdata)
                     message_queue.put(json.dumps(images_info)+"\n")
+                elif user_input == "/getMetadata":
+                    message_queue.put(json.dumps(localdata)+"\n")
                 else:
                     zmq_send_queue.put(user_input)
             else:
+                if user_input[-1] == "\n":
+                    user_input = user_input[:-1]
                 tcp_send_queue.put(user_input)
-                if user_input == "exit":
-                    break
         except EOFError:
-            # Handle EOFError if input is redirected or piped
-            tcp_send_queue.put("exit")
-            break
-    print("Exiting input_thread.")
+            terminate.set()
+            message_queue.put("")
+            tcp_send_queue.put("")
+            zmq_send_queue.put("")
+            zmq_connect_queue.put("")
 
 def tcp_send_thread(sock, zmq_url):
     """ Thread that sends messages from a queue to the shared TCP socket. """
     while True and not terminate.is_set():
         message = tcp_send_queue.get()
-        if message == "exit":
-            break
-        elif "/enterAlbum " in message:
+        if "/enterAlbum " == message[:12]:
             message = message + " " + zmq_url
+        elif message == "":
+            continue
         try:
             message = message + "\n"
             sock.sendall(message.encode('utf-8'))
         except Exception as e:
-            print(f"Failed to send message: {e}")
-            message_queue.put("exit")
-            break
+            terminate.set()
+            message_queue.put("")
+            zmq_send_queue.put("")
+            zmq_connect_queue.put("")
     print("Exiting tcp_send_thread.")
 
 def tcp_receive_thread(sock):
@@ -95,63 +110,87 @@ def tcp_receive_thread(sock):
             if data:
                 message = data.decode('utf-8')
                 if use_zmq_for_sending.is_set():
-                    zmq_connect_queue.put(message)
+                    if message[-1] == "\n":
+                        message = message[:-1]
+                    if "/connectTo " == message[:11]:
+                        zmq_connect_queue.put(message)
+                    if "Metadata:" == message[:9]:
+                        if debug: print("[DEBUG]Received metadata: ", message)
+                        zmq_connect_queue.put(message)
                 else:
-                    if "entered album" in message:
+                    if "/enterAlbum" == message[:11]:
+                        print("You successfully entered the album.")
                         use_zmq_for_sending.set()
                         tcp_send_queue.put("/getMetadata")
-                    elif "logged in " == message[0:10]:
+                    elif "/loginOk " == message[:9]:
+                        print("Logged in successfully.")
                         global username
                         if message[-1] == "\n":
-                            username = message[10:-1]
+                            username = message[9:-1]
                         else:
-                            username = message[10:]
-                    message_queue.put(message)
+                            username = message[9:]
+                    else:
+                        message_queue.put(message)
             else:
                 print("Server disconnected.")
                 terminate.set()
-                message_queue.put("exit")
-                tcp_send_queue.put("exit")
-                break
+                message_queue.put("")
+                tcp_send_queue.put("")
+                zmq_send_queue.put("")
+                zmq_connect_queue.put("")
         except Exception as e:
-            print(f"Failed to receive message: {e}")
-            message_queue.put("exit")
-            tcp_send_queue.put("exit")
-            break
+            terminate.set()
+            message_queue.put("")
+            tcp_send_queue.put("")
+            zmq_send_queue.put("")
+            zmq_connect_queue.put("")
     print("Exiting tcp_receive_thread.")
 
-def zmq_pub_thread(context_pub, pub):
+def zmq_pub_thread(context_pub, pub, zmq_url):
     """ ZeroMQ DEALER sends messages to the ROUTER. """
 
     # While context is not terminated
-    while context_pub:
+    while context_pub and not terminate.is_set():
         message = zmq_send_queue.get()
-        if message == "exit":
-            tcp_send_queue.put("/quit")
-            use_zmq_for_sending.clear()
-        elif "/getMetadata" == message:
-            message_queue.put(json.dumps(localdata)+"\n")
+        if debug: print("[DEBUG]zmq_pub_thread: ", message)
+        if message == "":
+            continue
         elif message[:20] == "/getMetadataFromAll ":
             time.sleep(2)
             pub.send_string(message)
         elif message[:27] == "/getMetadataFromAllRequest ":
             pub.send_string("/sendMetadata " + message[27:] + " " + json.dumps(localdata)+"\n")
+        elif message == "/quit":
+            if debug: print("[DEBUG]Telling subscribers to disconnect.")
+            pub.send_string("/disconnectFrom "+ zmq_url + "\n")
         else:
             message = message + "\n"
-            #send to all subscribers
             pub.send_string(message)
     print("Exiting zmq_pub_thread.")
 
 def zmq_sub_thread(context_sub, sub):
     """ ZeroMQ ROUTER receives messages from DEALER(s) and forwards them to output_thread. """
 
-    while context_sub:
+    while context_sub and not terminate.is_set():
         try:
             message = sub.recv_string()
-            if message[0:3] == "tcp":
+            if message == "":
+                continue
+
+            if message[-1] == "\n":
+                if debug: print("[DEBUG]zmq_sub_thread: ", message[:-1])
+            else:
+                if debug: print("[DEBUG]zmq_sub_thread: ", message)
+
+            if "/disconnectFrom " == message[:15]:
                 if message[-1] == "\n":
                     message = message[:-1]
-                sub.disconnect(message)
+                if debug: print("[DEBUG]Disconnecting from ", message[15:])
+                try:
+                    sub.disconnect(message[15:])
+                except Exception as _:
+                    pass
+                connected_pubs.remove(message[15:])
             elif message[:20] == "/getMetadataFromAll ":
                 zmq_send_queue.put("/getMetadataFromAllRequest " + message[20:])
             elif message[:14] == "/sendMetadata ":
@@ -162,7 +201,7 @@ def zmq_sub_thread(context_sub, sub):
                     data = message[next_space+15:]
                     if data[-1] == "\n":
                         data = data[:-1]
-                    print("update localdata")
+                    if debug: print("[DEBUG]localdata udpate with ", data)
                     localdata.update(remove_users_info(json.loads(data)))
             elif message[0] == "{":
                 if message[-1] == "\n":
@@ -172,39 +211,64 @@ def zmq_sub_thread(context_sub, sub):
                 message_queue.put(message)
             # message_queue.put(message.decode())
         except Exception as e:
-            print(f"Failed to receive ZeroMQ message: {e}")
-            break
+            terminate.set()
+            message_queue.put("")
+            tcp_send_queue.put("")
+            zmq_send_queue.put("")
+            zmq_connect_queue.put("")
     print("Exiting zmq_sub_thread.")
 
 def zmq_connect(zmq_url,sub):
-    while True:
+    while True and not terminate.is_set():
         message = zmq_connect_queue.get()
         # check if \n is at the end of the message and remove it
+        if message == "":
+            continue
         if message[-1] == "\n":
             message = message[:-1]
-        if message == "exit":
-            break
-        elif message[0:3] == "tcp":
-            # remove \n from the end of the message
-            sub.connect(message)
-        else:
+        if debug: print("[DEBUG]zmq_connect: ", message)
+        if "/quit" == message:
+            for _pub in connected_pubs:
+                if debug: print("[DEBUG]Disconnecting from ", _pub)
+                try:
+                    sub.disconnect(_pub)
+                except Exception as _:
+                    pass
+            connected_pubs.clear()
+        elif "/connectTo " == message[:11]:
+            if debug: print("[DEBUG]Connecting to ", message[11:])
+            sub.connect(message[11:])
+            connected_pubs.add(message[11:])
+        elif "Metadata:" == message[:9]:
+            if message[-1] == "\n":
+                message = message[:-1]
             try:
-                message_json = json.loads(message)
+                message_json = json.loads(message[9:])
                 count = 0
-                routers = extract_routers(message_json)
-                for router in routers:
-                    if zmq_url != router:
+                _pubs = extract_pubs(message_json)
+                for _pub in _pubs:
+                    if zmq_url != _pub:
                         count += 1
-                        sub.connect(router)
+                        if debug: print("[DEBUG]Connecting to ", _pub)
+                        sub.connect(_pub)
+                        connected_pubs.add(_pub)
                 if count == 0:
+                    if debug: print("[DEBUG]No other users to connect to, getting metadata central server.")
                     localdata.update(remove_users_info(message_json))
                 else:
+                    if debug: print("[DEBUG]Getting metadata from other users.")
                     zmq_send_queue.put("/getMetadataFromAll " + username)
             except Exception as e:
+                terminate.set()
+                message_queue.put("")
+                tcp_send_queue.put("")
+                zmq_send_queue.put("")
                 print(message)
+        else:
+            print(f"Unknown message: {message}")
     print("Exiting zmq_connect.")
 
-def extract_routers(data):
+def extract_pubs(data):
     routers = []
     users = data.get('users', {})
     for _, info in users.items():
@@ -244,7 +308,7 @@ def main():
         threading.Thread(target=input_thread),
         threading.Thread(target=tcp_send_thread, args=(sock, zmq_url,)),
         threading.Thread(target=tcp_receive_thread, args=(sock,)),
-        threading.Thread(target=zmq_pub_thread, args=(context_pub,pub,)),
+        threading.Thread(target=zmq_pub_thread, args=(context_pub,pub,zmq_url,)),
         threading.Thread(target=zmq_sub_thread, args=(context_sub,sub,)),
         threading.Thread(target=zmq_connect, args=(zmq_url,sub,))
     ]
@@ -257,11 +321,13 @@ def main():
             thread.join()
     except KeyboardInterrupt:
         print("\nReceived keyboard interrupt. Shutting down...")
-        tcp_send_queue.put("exit")
-        zmq_send_queue.put("exit")
-        message_queue.put("exit")
+        terminate.set()
+        message_queue.put("")
+        tcp_send_queue.put("")
+        zmq_send_queue.put("")
+        zmq_connect_queue.put("")
     finally:
-        pub.send_string(zmq_url + "\n")
+        pub.send_string("/disconnectFrom "+ zmq_url + "\n")
         try:
             pub.setsockopt(zmq.LINGER, 0)
             pub.close()
@@ -271,6 +337,8 @@ def main():
             sock.close()
         except Exception as e:
             print(f"Failed to close socket: {e}")
+        finally:
+            print("Press Enter to exit.")
 
 if __name__ == "__main__":
     main()
