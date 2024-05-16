@@ -223,7 +223,7 @@ user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid) ->
             inet:setopts(Sock, [{active, once}]),
             user(Sock, Username, LoginPid, PrimaryRoomPid, AlbumPid);
         {login, ok, _Username} ->
-            gen_tcp:send(Sock, <<"logged in\n">>),
+            gen_tcp:send(Sock, <<"logged in ", _Username/binary, "\n">>),
             inet:setopts(Sock, [{active, once}]),
             PrimaryRoomPid ! {enter, {_Username, Self}},
             user(Sock, _Username, LoginPid, PrimaryRoomPid, AlbumPid);
