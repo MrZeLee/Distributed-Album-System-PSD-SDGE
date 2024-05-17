@@ -100,10 +100,6 @@ class ORSet:
             if e not in self.remove_set:
                 self.remove_set[e] = set()
             self.remove_set[e].update(dots)
-            # if e in self.add_set:
-            #     self.add_set[e]['versions'].difference_update(self.remove_set[e])
-            #     if not self.add_set[e]['versions']:
-            #         del self.add_set[e]
         for replica_id, counter in other.counters.items():
             if replica_id not in self.counters or counter > self.counters[replica_id]:
                 self.counters[replica_id] = counter
@@ -240,19 +236,6 @@ def process_pending_messages():
         else:
             new_pending_messages.append(message)
     pending_messages = new_pending_messages
-
-def resolve_conflict(change1, change2):
-    clock1, clock2 = change1['clock'], change2['clock']
-    for user in clock1:
-        if clock1[user] > clock2.get(user, 0):
-            return change1
-        elif clock1[user] < clock2.get(user, 0):
-            return change2
-    if change1['action'] == "remove_user":
-        return change1
-    if change1['action'] == "remove_image":
-        return change1
-    return change2
 
 def broadcast_metadata_change(change):
     global localdata, vector_clock, username
