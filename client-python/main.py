@@ -293,6 +293,19 @@ def output_thread():
         print(message, end="")
     print("Exiting output_thread.")
 
+def remove_versions_from_localdata(data):
+    localdata_copy = data.copy()
+    if debug: print("[DEBUG]Removing versions from localdata: ", localdata_copy)
+    for v in localdata_copy.keys():
+        if isinstance(localdata_copy[v], dict):
+            for vv in localdata_copy[v].keys():
+                if isinstance(localdata_copy[v][vv], dict):
+                    if "value" in localdata_copy[v][vv].keys():
+                        localdata_copy[v][vv] = localdata_copy[v][vv]["value"]
+    if debug: print("[DEBUG]Removed versions from localdata: ", localdata_copy)
+    return localdata_copy
+
+
 def input_thread():
     while True:
         try:
@@ -301,6 +314,7 @@ def input_thread():
                 break
             if use_zmq_for_sending.is_set():
                 if user_input == "/quit":
+                    tcp_send_queue.put("/setMetadata " + json.dumps(remove_versions_from_localdata(localdata)) + "\n")
                     tcp_send_queue.put("/quit")
                     zmq_send_queue.put("/quit")
                     zmq_connect_queue.put("/quit")
@@ -586,8 +600,11 @@ def zmq_connect(zmq_url,sub):
             connected_pubs.clear()
         elif "/connectTo " == message[:11]:
             if debug: print("[DEBUG]Connecting to ", message[11:])
-            sub.connect(message[11:])
-            connected_pubs.add(message[11:])
+            try:
+                sub.connect(message[11:])
+                connected_pubs.add(message[11:])
+            except Exception as e:
+                if debug: print(f"[DEBUG]Error: {e}")
         elif "Metadata:" == message[:9]:
             if debug: print("[DEBUG]Received metadata: ", message)
             if message[-1] == "\n":
@@ -598,10 +615,13 @@ def zmq_connect(zmq_url,sub):
                 _pubs = extract_pubs(message_json)
                 for _pub in _pubs:
                     if zmq_url != _pub:
-                        count += 1
                         if debug: print("[DEBUG]Connecting to ", _pub)
-                        sub.connect(_pub)
-                        connected_pubs.add(_pub)
+                        try:
+                            sub.connect(_pub)
+                            connected_pubs.add(_pub)
+                            count += 1
+                        except Exception as e:
+                            if debug: print(f"[DEBUG]Error: {e}")
                 if count == 0:
                     if debug: print("[DEBUG]No other users to connect to, getting metadata central server.")
                     _localdata = remove_users_info(message_json)
