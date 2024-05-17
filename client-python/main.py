@@ -187,6 +187,7 @@ def apply_metadata_change(change):
 
         elif action == "add_image":
             temp_images_or_set = ORSet(username)
+            effect = merge_localdata_images(effect)
             temp_images_or_set.set_state(effect)
             images_or_set.merge(temp_images_or_set)
             localdata["images"] = images_or_set.elements()
@@ -197,34 +198,34 @@ def apply_metadata_change(change):
             images_or_set.merge(temp_images_or_set)
             localdata["images"] = images_or_set.elements()
 
-    elif action == "rate_image":
-        if image_name in localdata["images"]:
-            if image_name not in localdata["ratings"]:
-                localdata["ratings"][image_name] = {}
-            localdata["ratings"][image_name][user_name] = change["rating"]
-            if debug: print(f"[DEBUG]User {user_name} rated image {image_name} with {change['rating']}")
-
-    # if action == "add_user":
-    #     users_or_set.effect(effect)
-    #     localdata["users"] = users_or_set.elements()
-    # elif action == "remove_user":
-    #     users_or_set.effect(effect)
-    #     localdata["users"] = users_or_set.elements()
-    # elif action == "add_image":
-    #     images_or_set.effect(effect)
-    #     localdata["images"] = images_or_set.elements()
-    # elif action == "remove_image":
-    #     images_or_set.effect(effect)
-    #     localdata["images"] = images_or_set.elements()
-    # elif action == "rate_image":
-    #     if image_name in localdata["images"]:
-    #         if image_name not in localdata["ratings"]:
-    #             localdata["ratings"][image_name] = {}
-    #         localdata["ratings"][image_name][user_name] = change["rating"]
-    #         if debug: print(f"[DEBUG]User {user_name} rated image {image_name} with {change['rating']}")
+        elif action == "rate_image":
+            if image_name in localdata["images"]:
+                if "value" in localdata["images"][image_name]:
+                    if "users" in localdata["images"][image_name]["value"]:
+                        if user_name in localdata["images"][image_name]["value"]["users"]:
+                            pass
+                        else:
+                            localdata["images"][image_name]["value"]["users"][user_name] = change["rating"]
+                    else:
+                        localdata["images"][image_name]["value"]["users"] = {user_name: change["rating"]}
+                if debug: print(f"[DEBUG]User {user_name} rated image {image_name} with {change['rating']}")
 
     if debug: print("[DEBUG]Local data: ", localdata)
     process_pending_messages()
+
+def merge_localdata_images(received_images):
+    global localdata
+    if debug: print("[DEBUG]Merging localdata images with received images: ", received_images)
+    # keep ratings from localdata
+    for image, info in localdata.get('images', {}).items():
+        if image in received_images:
+            if 'value' in info and 'value' in received_images[image]:
+                if 'users' in info['value'] and 'users' in received_images[image]['value']:
+                    received_images[image]['value']['users'].update(info['value']['users'])
+                else:
+                    received_images[image]['value']['users'] = info['value'].get('users', {})
+    if debug: print("[DEBUG]Merged images: ", received_images)
+    return received_images
 
 def process_pending_messages():
     global pending_messages
@@ -263,7 +264,6 @@ def broadcast_metadata_change(change):
     }
     apply_metadata_change(change)
     process_pending_messages()
-    time.sleep(10)
     zmq_send_queue.put(json.dumps(message))
 
 def get_images_info(data):
@@ -365,7 +365,10 @@ def input_thread():
                             "user_name": username,
                             "rating": rating
                         }
-                        broadcast_metadata_change(change)
+                        if localdata.get('images', {}).get(image_name, {}).get('value', {}).get('users', {}).get(username) is None:
+                            broadcast_metadata_change(change)
+                        else:
+                            message_queue.put("You have already rated this image.\n")
                 else:
                     zmq_send_queue.put(user_input)
             else:
