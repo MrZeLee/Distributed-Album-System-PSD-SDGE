@@ -9,7 +9,7 @@ from rx.subject.subject import Subject
 import threading
 import time
 
-debug = True
+debug = False
 
 # Reactive subjects for inter-thread communication
 message_subject = Subject()
