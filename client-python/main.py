@@ -1,25 +1,25 @@
-import time
-import threading
-import queue
 import socket
 import zmq
 import sys
 import json
+from rx import operators as ops
+from rx.scheduler.threadpoolscheduler import ThreadPoolScheduler
+from rx.subject.behaviorsubject import BehaviorSubject
+from rx.subject.subject import Subject
+import threading
+import time
 
 debug = True
 
-# Global queues for inter-thread communication
-message_queue = queue.Queue()
-tcp_send_queue = queue.Queue()
-zmq_send_queue = queue.Queue()
-zmq_connect_queue = queue.Queue()
+# Reactive subjects for inter-thread communication
+message_subject = Subject()
+tcp_send_subject = Subject()
+zmq_send_subject = Subject()
+zmq_connect_subject = Subject()
+terminate_subject = BehaviorSubject(False)
+use_zmq_for_sending_subject = BehaviorSubject(False)
 
 connected_pubs = set()
-
-# Shared flag indicating whether to use ZeroMQ for sending messages
-use_zmq_for_sending = threading.Event()
-terminate = threading.Event()
-
 vector_clock = {}
 pending_messages = []
 localdata = {}
@@ -211,7 +211,7 @@ def apply_metadata_change(change):
 
 def merge_localdata_images(received_images):
     global localdata
-    if debug: print("[DEBUG]Merging localdata images with received images: ", received_images)
+    if debug: print("[DEBUG]Merging localdata images with received_images: ", received_images)
     # keep ratings from localdata
     for image, info in localdata.get('images', {}).items():
         if image in received_images:
@@ -247,7 +247,8 @@ def broadcast_metadata_change(change):
     }
     apply_metadata_change(change)
     process_pending_messages()
-    zmq_send_queue.put(json.dumps(message))
+    time.sleep(5)
+    zmq_send_subject.on_next(json.dumps(message))
 
 def get_images_info(data):
     images = data.get('images', {})
@@ -268,14 +269,6 @@ def get_images_info(data):
                 images_info[image] = "0.00"
     return images_info
 
-def output_thread():
-    while True and not terminate.is_set():
-        message = message_queue.get()
-        if message == "":
-            continue
-        print(message, end="")
-    print("Exiting output_thread.")
-
 def remove_versions_from_localdata(data):
     localdata_copy = data.copy()
     if debug: print("[DEBUG]Removing versions from localdata: ", localdata_copy)
@@ -288,30 +281,95 @@ def remove_versions_from_localdata(data):
     if debug: print("[DEBUG]Removed versions from localdata: ", localdata_copy)
     return localdata_copy
 
+def add_vector_clock(data):
+    data_copy = data.copy()
+    # add the vector clock to the data
+    data_copy["clock"] = vector_clock.copy()
+    return data_copy
 
-def input_thread():
-    while True:
-        try:
-            user_input = input()
-            if terminate.is_set():
-                break
-            if use_zmq_for_sending.is_set():
+def extract_pubs(data):
+    routers = []
+    users = data.get('users', {})
+    for _, info in users.items():
+        if info is not None and 'router' in info:
+            routers.append(info['router'])
+    return routers
+
+def remove_users_info(data):
+    for user in data["users"]:
+        if isinstance(data["users"][user], dict) and "versions" in data["users"][user]:
+            pass
+        else:
+            data["users"][user] = None
+    return data
+
+def add_version(data):
+    data["version"] = 0
+    return data
+
+def initialize_vector_clock(received_clock):
+    global vector_clock, username
+    for node, clock in received_clock.items():
+        vector_clock[node] = clock
+    if username not in vector_clock:
+        vector_clock[username] = 0
+
+def remove_vector_clock(data):
+    if "clock" in data:
+        del data["clock"]
+    return data
+
+def main():
+    global username
+    if len(sys.argv) < 2:
+        print("Usage: python script.py <port>")
+        sys.exit(1)
+    zmq_port = int(sys.argv[1])
+    host = 'localhost'
+    port = 8000
+    zmq_url = f"tcp://127.0.0.1:{zmq_port}"
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    context_pub = zmq.Context().instance()
+    pub = context_pub.socket(zmq.PUB)
+    pub.bind(zmq_url)
+    context_sub = zmq.Context().instance()
+    sub = context_sub.socket(zmq.SUB)
+    sub.setsockopt(zmq.SUBSCRIBE, b"")
+
+    thread_pool_scheduler = ThreadPoolScheduler(4)
+
+    def handle_output_thread():
+        message_subject.pipe(
+            ops.take_until(terminate_subject.pipe(ops.filter(lambda x: x))),
+            ops.observe_on(thread_pool_scheduler)
+        ).subscribe(
+            on_next=lambda message: print(message, end=""),
+            on_error=lambda e: print(f"Error1: {e}"),
+            on_completed=lambda: print("Exiting output_thread.")
+        )
+
+    def handle_input_thread():
+        def process_user_input(user_input):
+            if use_zmq_for_sending_subject.value:
                 if user_input == "/quit":
-                    tcp_send_queue.put("/setMetadata " + json.dumps(remove_versions_from_localdata(localdata)) + "\n")
-                    tcp_send_queue.put("/quit")
-                    zmq_send_queue.put("/quit")
-                    zmq_connect_queue.put("/quit")
-                    use_zmq_for_sending.clear()
+                    if debug: print("[DEBUG]json.dumps(remove_versions_from_localdata(localdata)): ", json.dumps(remove_versions_from_localdata(localdata)))
+                    tcp_send_subject.on_next(f"/setMetadata {json.dumps(remove_versions_from_localdata(localdata))}")
+                    tcp_send_subject.on_next("/quit")
+                    zmq_send_subject.on_next("/disconnectFrom " + zmq_url)
+                    zmq_connect_subject.on_next("/quit\n")
+                    use_zmq_for_sending_subject.on_next(False)
                 elif user_input == "/getImages":
                     images_info = get_images_info(localdata)
-                    message_queue.put(json.dumps(images_info)+"\n")
+                    message_subject.on_next(json.dumps(images_info) + "\n")
                 elif user_input == "/getMetadata":
-                    message_queue.put(json.dumps(localdata)+"\n")
+                    message_subject.on_next(json.dumps(localdata) + "\n")
                 elif user_input == "/getOrSet":
                     if users_or_set is not None:
-                        message_queue.put(str(users_or_set.state())+"\n")
+                        message_subject.on_next(str(users_or_set.state()) + "\n")
                     if images_or_set is not None:
-                        message_queue.put(str(images_or_set.state())+"\n")
+                        message_subject.on_next(str(images_or_set.state()) + "\n")
                 elif user_input.startswith("/addImage "):
                     parts = user_input.split(" ")
                     if len(parts) == 4:
@@ -365,320 +423,222 @@ def input_thread():
                         if localdata.get('images', {}).get(image_name, {}).get('value', {}).get('users', {}).get(username) is None:
                             broadcast_metadata_change(change)
                         else:
-                            message_queue.put("You have already rated this image.\n")
+                            message_subject.on_next("You have already rated this image.\n")
                 else:
-                    zmq_send_queue.put(user_input)
+                    zmq_send_subject.on_next(f"{username}: {user_input}")
             else:
                 if user_input[-1] == "\n":
                     user_input = user_input[:-1]
-                tcp_send_queue.put(user_input)
-        except EOFError:
-            terminate.set()
-            message_queue.put("")
-            tcp_send_queue.put("")
-            zmq_send_queue.put("")
-            zmq_connect_queue.put("")
+                tcp_send_subject.on_next(user_input)
 
-def tcp_send_thread(sock, zmq_url):
-    while True and not terminate.is_set():
-        message = tcp_send_queue.get()
-        if "/enterAlbum " == message[:12]:
-            message = message + " " + zmq_url
-        elif message == "":
-            continue
-        try:
-            message = message + "\n"
-            sock.sendall(message.encode('utf-8'))
-        except Exception as e:
-            terminate.set()
-            message_queue.put("")
-            zmq_send_queue.put("")
-            zmq_connect_queue.put("")
-    print("Exiting tcp_send_thread.")
+        while not terminate_subject.value:
+            try:
+                user_input = input()
+                if terminate_subject.value:
+                    break
+                process_user_input(user_input)
+            except EOFError:
+                terminate_subject.on_next(True)
+                message_subject.on_next("")
+                tcp_send_subject.on_next("")
+                zmq_send_subject.on_next("")
+                zmq_connect_subject.on_next("")
 
-def tcp_receive_thread(sock):
-    while True and not terminate.is_set():
-        try:
-            data = sock.recv(1024)
-            if data:
-                message = data.decode('utf-8')
-                if use_zmq_for_sending.is_set():
-                    if message[-1] == "\n":
-                        message = message[:-1]
-                    if "/connectTo " == message[:11]:
-                        zmq_connect_queue.put(message)
-                    if "Metadata:" == message[:9]:
-                        if debug: print("[DEBUG]Received metadata: ", message)
-                        zmq_connect_queue.put(message)
-                else:
-                    if "/enterAlbum" == message[:11]:
-                        print("You successfully entered the album.")
-                        use_zmq_for_sending.set()
-                        tcp_send_queue.put("/getMetadata")
-                    elif "/loginOk " == message[:9]:
-                        print("Logged in successfully.")
-                        global username
-                        if message[-1] == "\n":
-                            username = message[9:-1]
-                        else:
+    def edit_message(message):
+        if message.startswith("/enterAlbum"):
+            message_multipart = message.split(" ")
+            if len(message_multipart) == 2:
+                return f"{message_multipart[0]} {message_multipart[1]} {zmq_url}"
+        return message
+
+    def handle_tcp_send_thread(sock):
+        tcp_send_subject.pipe(
+            ops.take_until(terminate_subject.pipe(ops.filter(lambda x: x))),
+            ops.observe_on(thread_pool_scheduler)
+        ).subscribe(
+            on_next=lambda message: sock.sendall(f"{edit_message(message)}\n".encode('utf-8')),
+            on_error=lambda e: print(f"Error2: {e}"),
+            on_completed=lambda: print("Exiting tcp_send_thread.")
+        )
+
+    def handle_tcp_receive_thread(sock):
+        while not terminate_subject.value:
+            try:
+                data = sock.recv(1024)
+                if data:
+                    message = data.decode('utf-8').rstrip('\n')
+                    if use_zmq_for_sending_subject.value:
+                        if message.startswith("/connectTo "):
+                            zmq_connect_subject.on_next(message)
+                        if message.startswith("Metadata:"):
+                            zmq_connect_subject.on_next(message)
+                    else:
+                        if message.startswith("/enterAlbum"):
+                            print("You successfully entered the album.")
+                            use_zmq_for_sending_subject.on_next(True)
+                            tcp_send_subject.on_next("/getMetadata")
+                        elif message.startswith("/loginOk "):
+                            print("Logged in successfully.")
+                            global username
                             username = message[9:]
-                        global users_or_set, images_or_set
-                        users_or_set = ORSet(username)
-                        images_or_set = ORSet(username)
-                    else:
-                        message_queue.put(message)
-            else:
-                print("Server disconnected.")
-                terminate.set()
-                message_queue.put("")
-                tcp_send_queue.put("")
-                zmq_send_queue.put("")
-                zmq_connect_queue.put("")
-        except Exception as e:
-            terminate.set()
-            message_queue.put("")
-            tcp_send_queue.put("")
-            zmq_send_queue.put("")
-            zmq_connect_queue.put("")
-    print("Exiting tcp_receive_thread.")
-
-def zmq_pub_thread(context_pub, pub, zmq_url):
-    while context_pub and not terminate.is_set():
-        message = zmq_send_queue.get()
-        if debug: print("[DEBUG]zmq_pub_thread: ", message)
-        if message == "":
-            continue
-        elif message[:20] == "/getMetadataFromAll ":
-            time.sleep(2)
-            pub.send_string(message)
-        elif message[:27] == "/getMetadataFromAllRequest ":
-            if users_or_set is not None and images_or_set is not None:
-                pub.send_string("/sendMetadata " + message[27:] + " " + json.dumps(add_vector_clock({'users': users_or_set.state(), 'images': images_or_set.state()}))+"\n")
-        elif message == "/quit":
-            if debug: print("[DEBUG]Telling subscribers to disconnect.")
-            pub.send_string("/disconnectFrom "+ zmq_url + "\n")
-        else:
-            message = message + "\n"
-            pub.send_string(message)
-    print("Exiting zmq_pub_thread.")
-
-def add_vector_clock(data):
-    data_copy = data.copy()
-    # add the vector clock to the data
-    data_copy["clock"] = vector_clock.copy()
-    return data_copy
-
-def zmq_sub_thread(context_sub, sub):
-    while context_sub and not terminate.is_set():
-        try:
-            message = sub.recv_string()
-            if message == "":
-                continue
-
-            if message[-1] == "\n":
-                if debug: print("[DEBUG]zmq_sub_thread: ", message[:-1])
-            else:
-                if debug: print("[DEBUG]zmq_sub_thread: ", message)
-
-            if "/disconnectFrom " == message[:15]:
-                if message[-1] == "\n":
-                    message = message[:-1]
-                if debug: print("[DEBUG]Disconnecting from ", message[15:])
-                try:
-                    sub.disconnect(message[15:])
-                except Exception as _:
-                    pass
-                connected_pubs.remove(message[15:])
-            elif message[:20] == "/getMetadataFromAll ":
-                zmq_send_queue.put("/getMetadataFromAllRequest " + message[20:])
-            elif message[:14] == "/sendMetadata ":
-                next_space = message[14:].find(" ")
-                _username = message[14:next_space+14]
-                if _username == username:
-                    data = message[next_space+15:]
-                    if data[-1] == "\n":
-                        data = data[:-1]
-                    if debug: print("[DEBUG]localdata udpate with ", data)
-
-                    if debug: print("[DEBUG]Recieved metadata: ", data)
-                    message_json = json.loads(data)
-                    if debug: print("[DEBUG]Recieved metadata json: ", message_json)
-                    initialize_vector_clock(message_json.get('clock', {}))
-                    _localdata = remove_vector_clock(message_json)
-                    if debug: print("[DEBUG]_Local data: ", _localdata)
-                    # localdata.update(remove_vector_clock(remove_users_info(message_json)))
-                    if users_or_set is not None and images_or_set is not None:
-                        if debug: print("[DEBUG]Users: ", _localdata.get('users', {}))
-                        if debug: print("[DEBUG]Images: ", _localdata.get('images', {}))
-                        received_users_state = _localdata.get('users', {})
-                        received_images_state = _localdata.get('images', {})
-                        
-                        # Create temporary ORSets to merge states
-                        temp_users_or_set = ORSet(username)
-                        temp_images_or_set = ORSet(username)
-                        
-                        temp_users_or_set.set_state(received_users_state)
-                        temp_images_or_set.set_state(received_images_state)
-                        
-                        users_or_set.merge(temp_users_or_set)
-                        images_or_set.merge(temp_images_or_set)
-                        
-                        # Update localdata after merging
-                        localdata["users"] = users_or_set.elements()
-                        localdata["images"] = images_or_set.elements()
-                    else:
-                        raise Exception("Users or images ORSet not initialized.")
-            elif message[0] == "{":
-                if message[-1] == "\n":
-                    message = message[:-1]
-                message = json.loads(message)
-                sender = message["sender"]
-                received_clock = message["clock"]
-                change = message["change"]
-                if is_causally_ready(received_clock, sender):
-                    update_vector_clock(received_clock)
-                    apply_metadata_change(change)
-                    process_pending_messages()
+                            global users_or_set, images_or_set
+                            users_or_set = ORSet(username)
+                            images_or_set = ORSet(username)
+                        else:
+                            if message[-1] != "\n":
+                                message += "\n"
+                            if debug: print(f"[DEBUG]Received message: {message}", end="")
+                            message_subject.on_next(message)
                 else:
-                    pending_messages.append(message)
-            else:
-                message_queue.put(message)
-        except Exception as e:
-            print(f"Error: {e}")
-            terminate.set()
-            message_queue.put("")
-            tcp_send_queue.put("")
-            zmq_send_queue.put("")
-            zmq_connect_queue.put("")
-    print("Exiting zmq_sub_thread.")
+                    print("Server disconnected.")
+                    terminate_subject.on_next(True)
+                    message_subject.on_next("")
+                    tcp_send_subject.on_next("")
+                    zmq_send_subject.on_next("")
+                    zmq_connect_subject.on_next("")
+            except Exception as e:
+                terminate_subject.on_next(True)
+                message_subject.on_next("")
+                tcp_send_subject.on_next("")
+                zmq_send_subject.on_next("")
+                zmq_connect_subject.on_next("")
 
-def initialize_vector_clock(received_clock):
-    global vector_clock, username
-    for node, clock in received_clock.items():
-        vector_clock[node] = clock
-    if username not in vector_clock:
-        vector_clock[username] = 0
+    def handle_zmq_pub_thread(context_pub, pub):
+        zmq_send_subject.pipe(
+            ops.take_until(terminate_subject.pipe(ops.filter(lambda x: x))),
+            ops.observe_on(thread_pool_scheduler)
+        ).subscribe(
+            on_next=lambda message: pub.send_string(f"{message}\n"),
+            on_error=lambda e: print(f"Error3: {e}"),
+            on_completed=lambda: print("Exiting zmq_pub_thread.")
+        )
 
-def remove_vector_clock(data):
-    if "clock" in data:
-        del data["clock"]
-    return data
+    def handle_zmq_sub_thread(context_sub, sub):
+        while not terminate_subject.value:
+            try:
+                message = sub.recv_string().rstrip('\n')
+                if message:
+                    if message.startswith("/disconnectFrom "):
+                        if debug: print(f"[DEBUG]Disconnecting from {message[16:]}")
+                        try:
+                            sub.disconnect(message[16:])
+                            connected_pubs.remove(message[16:])
+                        except Exception as e:
+                            if debug: print(f"[DEBUG]Failed to disconnect from {message[16:]}: {e}")
+                    elif message.startswith("/getMetadataFromAll "):
+                        if users_or_set is not None and images_or_set is not None:
+                            if debug: print("[DEBUG]Sending metadata to all.")
+                            zmq_send_subject.on_next("/sendMetadata " + message[20:] + " " + json.dumps(add_vector_clock({'users': users_or_set.state(), 'images': images_or_set.state()}))+"\n")
+                    elif message.startswith("/sendMetadata "):
+                        next_space = message[14:].find(" ")
+                        _username = message[14:next_space + 14]
+                        if _username == username:
+                            data = json.loads(message[next_space + 15:])
+                            initialize_vector_clock(data.get('clock', {}))
+                            _localdata = remove_vector_clock(data)
+                            if users_or_set is not None and images_or_set is not None:
+                                received_users_state = _localdata.get('users', {})
+                                received_images_state = _localdata.get('images', {})
+                                temp_users_or_set = ORSet(username)
+                                temp_images_or_set = ORSet(username)
+                                temp_users_or_set.set_state(received_users_state)
+                                temp_images_or_set.set_state(received_images_state)
+                                users_or_set.merge(temp_users_or_set)
+                                images_or_set.merge(temp_images_or_set)
+                                localdata["users"] = users_or_set.elements()
+                                localdata["images"] = images_or_set.elements()
+                            else:
+                                raise Exception("Users or images ORSet not initialized.")
+                    elif message[0] == "{":
+                        message = json.loads(message)
+                        sender = message["sender"]
+                        received_clock = message["clock"]
+                        change = message["change"]
+                        if is_causally_ready(received_clock, sender):
+                            update_vector_clock(received_clock)
+                            apply_metadata_change(change)
+                            process_pending_messages()
+                        else:
+                            pending_messages.append(message)
+                    else:
+                        if message[-1] != "\n":
+                            message += "\n"
+                        message_subject.on_next(message)
+            except Exception as e:
+                print(f"Error4: {e}")
+                terminate_subject.on_next(True)
+                message_subject.on_next("")
+                tcp_send_subject.on_next("")
+                zmq_send_subject.on_next("")
+                zmq_connect_subject.on_next("")
 
-def zmq_connect(zmq_url,sub):
-    global localdata, users_or_set, images_or_set
-    while True and not terminate.is_set():
-        message = zmq_connect_queue.get()
-        if message == "":
-            continue
-        if message[-1] == "\n":
-            message = message[:-1]
-        if debug: print("[DEBUG]zmq_connect: ", message)
-        if "/quit" == message:
+    def handle_zmq_connect(zmq_url, sub):
+        zmq_connect_subject.pipe(
+            ops.take_until(terminate_subject.pipe(ops.filter(lambda x: x))),
+            ops.observe_on(thread_pool_scheduler)
+        ).subscribe(
+            on_next=lambda message: process_zmq_connect(message, zmq_url, sub),
+            on_error=lambda e: print(f"Error5: {e}"),
+            on_completed=lambda: print("Exiting zmq_connect.")
+        )
+
+    def process_zmq_connect(message, zmq_url, sub):
+        global localdata, users_or_set, images_or_set
+        if message.startswith("/quit"):
             for _pub in connected_pubs:
-                if debug: print("[DEBUG]Disconnecting from ", _pub)
                 try:
                     sub.disconnect(_pub)
-                except Exception as _:
-                    pass
+                except Exception as e:
+                    if debug: print(f"[DEBUG]Failed to disconnect from {_pub}: {e}")
             connected_pubs.clear()
-        elif "/connectTo " == message[:11]:
-            if debug: print("[DEBUG]Connecting to ", message[11:])
+        elif message.startswith("/connectTo "):
+            if debug: print(f"[DEBUG]Connecting to {message[11:]}")
             try:
                 sub.connect(message[11:])
                 connected_pubs.add(message[11:])
             except Exception as e:
-                if debug: print(f"[DEBUG]Error: {e}")
-        elif "Metadata:" == message[:9]:
-            if debug: print("[DEBUG]Received metadata: ", message)
-            if message[-1] == "\n":
-                message = message[:-1]
+                if debug: print(f"[DEBUG]Failed to connect to {message[11:]}: {e}")
+        elif message.startswith("Metadata:"):
             try:
                 message_json = json.loads(message[9:])
                 count = 0
                 _pubs = extract_pubs(message_json)
                 for _pub in _pubs:
                     if zmq_url != _pub:
-                        if debug: print("[DEBUG]Connecting to ", _pub)
+                        if debug: print(f"[DEBUG]Connecting to {_pub}")
                         try:
                             sub.connect(_pub)
                             connected_pubs.add(_pub)
                             count += 1
                         except Exception as e:
-                            if debug: print(f"[DEBUG]Error: {e}")
+                            if debug: print(f"[DEBUG]Failed to connect to {_pub}: {e}")
                 if count == 0:
-                    if debug: print("[DEBUG]No other users to connect to, getting metadata central server.")
                     _localdata = remove_users_info(message_json)
                     if users_or_set is not None and images_or_set is not None:
                         for user, value in _localdata.get('users', {}).items():
                             users_or_set.add(user, value)
                         for image, value in _localdata.get('images', {}).items():
                             images_or_set.add(image, value)
-                        if debug: print("[DEBUG]Local data: ", localdata)
-                        localdata.update({"users" : users_or_set.elements(), "images" : images_or_set.elements()})
-                        if debug: print("[DEBUG]Local data after update: ", localdata)
+                        localdata.update({"users": users_or_set.elements(), "images": images_or_set.elements()})
                 else:
-                    if debug: print("[DEBUG]Getting metadata from other users.")
-                    zmq_send_queue.put("/getMetadataFromAll " + username)
+                    time.sleep(1)
+                    zmq_send_subject.on_next(f"/getMetadataFromAll {username}")
             except Exception as e:
-                # print the error stack
-                if debug: print("[DEBUG]Error1: ", e.with_traceback(None))
-                terminate.set()
-                message_queue.put("")
-                tcp_send_queue.put("")
-                zmq_send_queue.put("")
-                print(message)
-            if debug: print("[DEBUG]Leave Metadata.")
-        else:
-            print(f"Unknown message: {message}")
-    print("Exiting zmq_connect.")
-
-def extract_pubs(data):
-    routers = []
-    users = data.get('users', {})
-    for _, info in users.items():
-        if info is not None and 'router' in info:
-            routers.append(info['router'])
-    return routers
-
-def remove_users_info(data):
-    for user in data["users"]:
-        if isinstance(data["users"][user], dict) and "versions" in data["users"][user]:
-            pass
-        else:
-            data["users"][user] = None
-    return data
-
-def add_version(data):
-    data["version"] = 0
-    return data
-
-def main():
-    global username
-    if len(sys.argv) < 2:
-        print("Usage: python script.py <port>")
-        sys.exit(1)
-    zmq_port = int(sys.argv[1])
-    host = 'localhost'
-    port = 8000
-    zmq_url = "tcp://127.0.0.1:" + str(zmq_port)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((host, port))
-    context_pub = zmq.Context().instance()
-    pub = context_pub.socket(zmq.PUB)
-    pub.bind("tcp://127.0.0.1:" + str(zmq_port))
-    context_sub = zmq.Context().instance()
-    sub = context_sub.socket(zmq.SUB)
-    sub.setsockopt(zmq.SUBSCRIBE, b"")
+                print(f"Error6: {e}")
+                terminate_subject.on_next(True)
+                message_subject.on_next("")
+                tcp_send_subject.on_next("")
+                zmq_send_subject.on_next("")
+                zmq_connect_subject.on_next("")
 
     threads = [
-        threading.Thread(target=output_thread),
-        threading.Thread(target=input_thread),
-        threading.Thread(target=tcp_send_thread, args=(sock, zmq_url,)),
-        threading.Thread(target=tcp_receive_thread, args=(sock,)),
-        threading.Thread(target=zmq_pub_thread, args=(context_pub,pub,zmq_url,)),
-        threading.Thread(target=zmq_sub_thread, args=(context_sub,sub,)),
-        threading.Thread(target=zmq_connect, args=(zmq_url,sub,))
+        threading.Thread(target=handle_output_thread),
+        threading.Thread(target=handle_input_thread),
+        threading.Thread(target=handle_tcp_send_thread, args=(sock,)),
+        threading.Thread(target=handle_tcp_receive_thread, args=(sock,)),
+        threading.Thread(target=handle_zmq_pub_thread, args=(context_pub, pub)),
+        threading.Thread(target=handle_zmq_sub_thread, args=(context_sub, sub)),
+        threading.Thread(target=handle_zmq_connect, args=(zmq_url, sub))
     ]
 
     for thread in threads:
@@ -689,13 +649,13 @@ def main():
             thread.join()
     except KeyboardInterrupt:
         print("\nReceived keyboard interrupt. Shutting down...")
-        terminate.set()
-        message_queue.put("")
-        tcp_send_queue.put("")
-        zmq_send_queue.put("")
-        zmq_connect_queue.put("")
+        terminate_subject.on_next(True)
+        message_subject.on_next("")
+        tcp_send_subject.on_next("")
+        zmq_send_subject.on_next("")
+        zmq_connect_subject.on_next("")
     finally:
-        pub.send_string("/disconnectFrom "+ zmq_url + "\n")
+        pub.send_string(f"/disconnectFrom {zmq_url}\n")
         try:
             pub.setsockopt(zmq.LINGER, 0)
             pub.close()
@@ -710,4 +670,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
