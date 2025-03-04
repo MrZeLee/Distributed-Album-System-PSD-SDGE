@@ -202,12 +202,15 @@ The project implements different variants of an ORSet CRDT across branches:
 
 ```
 .
-├── client-python/        # Python client implementation
-│   ├── main.py           # Main client code (different in each branch)
-│   └── requirements.txt  # Python dependencies
-├── server-erlang/        # Erlang central server
-│   ├── src/              # Server source code
-│   └── start_server.sh   # Script to start the Erlang server
-└── README.md             # This file
+├── client-python/           # Python client implementation
+│   ├── main.py              # Main client code (different in each branch)
+│   └── requirements.txt     # Python dependencies
+├── central-server/          # Erlang central server
+│   ├── README.md            # Server documentation
+│   ├── rebar.config         # Erlang build configuration
+│   ├── src/                 # Server source files
+│   │   ├── server.app.src   # OTP application resource file
+│   │   └── server_app.erl   # Main server implementation
+└── README.md                # Project documentation
 ```
 
